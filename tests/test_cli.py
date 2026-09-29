@@ -55,12 +55,31 @@ def overlay(monkeypatch):
 
 @pytest.fixture
 def isolated(tmp_path, monkeypatch):
-    """Point the default config at a throwaway database."""
+    """Point the default config at a throwaway database.
+
+    Also stubs the context engine: a CI runner reports a *very* idle user, and
+    a real probe would silently suppress every suggestion.
+    """
     monkeypatch.setenv("AETHER_CONFIG", str(tmp_path / "none.json"))
     monkeypatch.setattr(
         cli, "load_config", lambda _p=None: _isolated_config(tmp_path)
     )
+    monkeypatch.setattr("aether.app.ContextEngine", StubContext)
     return tmp_path
+
+
+class StubContext:
+    """Always an active, non-idle user with an unremarkable window."""
+
+    def __init__(self, config, probes=None) -> None:
+        self.config = config
+        self.captures = 0
+
+    def capture(self, cwd=None):
+        from aether.models import ContextSnapshot
+
+        self.captures += 1
+        return ContextSnapshot(active_app="Code.exe", window_title=f"file{self.captures}.py")
 
 
 def _isolated_config(tmp_path):
