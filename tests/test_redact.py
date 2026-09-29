@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from aether.redact import fingerprint_clipboard, normalize_title, redact
+from aether.redact import (
+    fingerprint_clipboard,
+    normalize_title,
+    redact,
+    strip_modified_marker,
+)
 
 
 @pytest.mark.parametrize(
@@ -58,3 +63,35 @@ def test_fingerprint_is_stable_and_never_reveals_content() -> None:
 def test_fingerprint_of_empty_clipboard_is_none() -> None:
     assert fingerprint_clipboard("") is None
     assert fingerprint_clipboard("   \n ") is None
+
+
+# --- the "unsaved changes" marker is signal, not noise --------------------
+
+
+def test_normalize_title_keeps_the_modified_marker() -> None:
+    assert normalize_title("*draft.md - Google Chrome") == "*draft.md"
+
+
+def test_strip_modified_marker_reports_the_flag() -> None:
+    assert strip_modified_marker("*draft.md") == (True, "draft.md")
+
+
+@pytest.mark.parametrize("raw", ["*draft.md", "•draft.md", "●draft.md"])
+def test_every_marker_is_recognised(raw: str) -> None:
+    modified, cleaned = strip_modified_marker(raw)
+    assert modified is True
+    assert cleaned == "draft.md"
+
+
+def test_strip_modified_marker_leaves_clean_titles_alone() -> None:
+    assert strip_modified_marker("draft.md") == (False, "draft.md")
+
+
+def test_lone_marker_is_not_a_modified_document() -> None:
+    modified, cleaned = strip_modified_marker("*")
+    assert modified is False
+    assert cleaned == ""
+
+
+def test_marker_is_kept_out_of_browser_suffix_trimming() -> None:
+    assert normalize_title("*Rust docs - Google Chrome") == "*Rust docs"

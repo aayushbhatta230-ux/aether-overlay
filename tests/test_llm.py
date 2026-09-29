@@ -108,3 +108,97 @@ def test_unknown_app_skips_llm_entirely(config) -> None:
     engine = SuggestionEngine(config, transport)
     engine.generate(ContextSnapshot(active_app="unknown"))
     assert transport.calls == []
+
+
+# --------------------------------------------------------------------------
+# Deterministic rules: the product still has to be worth running offline.
+# --------------------------------------------------------------------------
+
+
+def _rules_for(config, **kwargs) -> list:
+    engine = SuggestionEngine(config, NullTransport())
+    snapshot = ContextSnapshot(**kwargs)
+    return engine.generate(snapshot)
+
+
+def test_error_rule_fires_on_a_failing_window(config) -> None:
+    out = _rules_for(config, active_app="Code.exe", window_title="Traceback (most recent call last)")
+    assert out and "error" in out[0].title.lower()
+    assert out[0].source == "rules"
+    assert out[0].risk == "low", "a hint must never be gated or risky"
+
+
+def test_meeting_rule_fires_on_a_conference_app(config) -> None:
+    out = _rules_for(config, active_app="Zoom.exe", window_title="Weekly sync")
+    assert out and "meeting" in out[0].title.lower()
+
+
+def test_meeting_rule_also_matches_the_title(config) -> None:
+    out = _rules_for(config, active_app="chrome.exe", window_title="Meet - standup")
+    assert out and "meeting" in out[0].title.lower()
+
+
+def test_unsaved_document_rule(config) -> None:
+    out = _rules_for(config, active_app="Code.exe", window_title="notes.md",
+                     document_modified=True)
+    assert out and "unsaved" in out[0].title.lower()
+
+
+def test_dwell_rule_fires_after_the_configured_time(config) -> None:
+    config.dwell_reminder_s = 600
+    out = _rules_for(config, active_app="Code.exe", window_title="app.py",
+                     app_dwell_seconds=1200)
+    assert out and "minutes in Code.exe" in out[0].title
+    assert "20 minutes" in out[0].title
+
+
+def test_dwell_rule_stays_quiet_below_the_threshold(config) -> None:
+    config.dwell_reminder_s = 3600
+    out = _rules_for(config, active_app="Code.exe", window_title="app.py",
+                     app_dwell_seconds=1200)
+    assert not any("minutes in" in s.title for s in out)
+
+
+def test_dwell_rule_can_be_switched_off(config) -> None:
+    config.dwell_reminder_s = 0
+    out = _rules_for(config, active_app="Code.exe", window_title="app.py",
+                     app_dwell_seconds=99999)
+    assert not any("minutes in" in s.title for s in out)
+
+
+def test_branch_rule_is_silent_on_a_default_branch(config) -> None:
+    """`main` with nothing else going on is not worth a card."""
+    out = _rules_for(config, active_app="Code.exe", window_title="app.py",
+                     git_branch="main", app_dwell_seconds=0.0)
+    assert out == []
+
+
+def test_dwell_rule_still_fires_on_a_default_branch(config) -> None:
+    """Dwell is about the session, not the branch: it is orthogonal."""
+    config.dwell_reminder_s = 600
+    out = _rules_for(config, active_app="Code.exe", window_title="app.py",
+                     git_branch="main", app_dwell_seconds=1200)
+    assert out and "minutes in Code.exe" in out[0].title
+
+
+def test_focused_work_outranks_a_bare_branch_hint(config) -> None:
+    """An error beats a branch reminder: order the rules by usefulness."""
+    out = _rules_for(config, active_app="Code.exe", window_title="TypeError in build",
+                     git_branch="feat/x")
+    assert out and "error" in out[0].title.lower()
+
+
+def test_rules_can_be_disabled_entirely(config, snapshot) -> None:
+    config.offline_fallback = False
+    assert SuggestionEngine(config, NullTransport()).generate(snapshot) == []
+
+
+def test_rules_use_the_configured_dwell_threshold(config) -> None:
+    """A different threshold is a different rule, not a duplicate card."""
+    config.dwell_reminder_s = 600
+    first = _rules_for(config, active_app="Code.exe", window_title="a.py",
+                       app_dwell_seconds=700)[0]
+    config.dwell_reminder_s = 3600
+    out = _rules_for(config, active_app="Code.exe", window_title="a.py",
+                     app_dwell_seconds=3700)
+    assert out and out[0].fingerprint != first.fingerprint

@@ -5,9 +5,12 @@ from __future__ import annotations
 from aether.models import Suggestion
 from aether.safety import (
     BLOCK_HIGH,
+    BLOCK_MEDIUM_DISABLED,
+    HELD_FOR_APPROVAL,
     filter_suggestions,
     gate,
     never_auto_execute,
+    partition_suggestions,
     requires_approval,
 )
 
@@ -56,3 +59,43 @@ def test_filter_sorts_by_confidence() -> None:
 def test_aether_has_no_autonomous_execution_path() -> None:
     # Documented invariant: AETHER observes, it never acts.
     assert never_auto_execute() is False
+
+
+# --- reasons and partitioning -------------------------------------------
+
+
+def test_gate_reasons_are_stable() -> None:
+    assert gate(_s("high"))[1] == BLOCK_HIGH
+    assert gate(_s("medium"))[1] == HELD_FOR_APPROVAL
+
+
+def test_medium_can_be_withheld_by_configuration(config) -> None:
+    config.allow_medium_risk = False
+    ok, reason = gate(_s("medium"), config)
+    assert ok is False
+    assert reason == BLOCK_MEDIUM_DISABLED
+
+
+def test_configured_gate_still_allows_low(config) -> None:
+    config.allow_medium_risk = False
+    assert gate(_s("low"), config)[0] is True
+
+
+def test_partition_reports_what_it_withheld_and_why() -> None:
+    allowed, blocked = partition_suggestions([_s("low"), _s("high")])
+    assert [s.risk for s in allowed] == ["low"]
+    assert len(blocked) == 1
+    sug, reason = blocked[0]
+    assert sug.risk == "high"
+    assert reason == BLOCK_HIGH
+
+
+def test_partition_keeps_medium_when_allowed(config) -> None:
+    allowed, blocked = partition_suggestions([_s("medium")], config)
+    assert len(allowed) == 1
+    assert blocked == []
+
+
+def test_config_defaults_do_not_block_anything(config) -> None:
+    kept = filter_suggestions([_s("low"), _s("medium"), _s("high")], config)
+    assert [s.risk for s in kept] == ["low", "medium"]

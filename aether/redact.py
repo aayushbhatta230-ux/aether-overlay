@@ -7,6 +7,7 @@ failure mode than leaking an API key into a model prompt.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from re import Pattern
 
@@ -32,11 +33,16 @@ _RULES: tuple[tuple[str, Pattern[str]], ...] = (
     ("[REDACTED_IP]", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
 )
 
-#: Title-bar noise that carries no signal but a lot of noise.
+#: Title-bar noise that carries no signal but a lot of noise. The editor's
+#: leading ``*`` is deliberately *not* here: it means "unsaved changes", which
+#: is signal, so it is lifted into a flag by the context engine instead.
 _NOISE_TOKENS = (
     " - Google Chrome", " - Microsoft Edge", " - Firefox",
-    "Administrator:", " - Notepad", "*", " - Windows Explorer",
+    "Administrator:", " - Notepad", " - Windows Explorer",
 )
+
+#: Characters editors prepend to a title to flag unsaved work.
+_MODIFIED_MARKERS = ("*", "•", "●")
 
 
 def redact(text: str) -> str:
@@ -49,15 +55,35 @@ def redact(text: str) -> str:
     return out
 
 
+def strip_modified_marker(title: str) -> tuple[bool, str]:
+    """Split an editor's "unsaved changes" marker off the front of a title.
+
+    Returns ``(is_modified, cleaned_title)``. Keeping this out of
+    :func:`normalize_title` preserves the signal instead of discarding it.
+    """
+    if not title:
+        return (False, title)
+    stripped = title.lstrip()
+    modified = stripped.startswith(_MODIFIED_MARKERS)
+    if modified:
+        cleaned = stripped.lstrip("".join(_MODIFIED_MARKERS)).strip()
+        return (bool(cleaned), cleaned)
+    return (False, stripped)
+
+
 def normalize_title(title: str, max_len: int = 120) -> str:
-    """Trim browser suffixes, collapse whitespace, and cap the length."""
+    """Trim browser suffixes, collapse whitespace, and cap the length.
+
+    The "unsaved changes" marker is *not* touched here - it is signal, and
+    :func:`strip_modified_marker` lifts it into a flag separately.
+    """
     if not title:
         return ""
-    cleaned = title
+    cleaned = " ".join(title.split())
     for token in _NOISE_TOKENS:
         if cleaned.endswith(token):
             cleaned = cleaned[: -len(token)]
-    cleaned = " ".join(cleaned.split())
+    cleaned = cleaned.strip()
     if len(cleaned) > max_len:
         cleaned = cleaned[: max_len - 1].rstrip() + "…"
     return cleaned
@@ -71,7 +97,5 @@ def fingerprint_clipboard(text: str) -> str | None:
     """
     if not text or not text.strip():
         return None
-    import hashlib
-
     digest = hashlib.sha256(text.strip().encode("utf-8", "ignore")).hexdigest()
     return digest[:12]

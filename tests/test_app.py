@@ -65,13 +65,79 @@ def test_high_risk_never_reaches_the_user(config, vault, snapshot) -> None:
     assert app.stats.suppressed_risk == 1
 
 
-def test_cooldown_prevents_repeats(config, vault, snapshot) -> None:
+def test_blocked_suggestion_is_audited(config, vault, snapshot) -> None:
+    """Withholding must be provable after the fact, not silent."""
+    items = [Suggestion(title="Delete everything", body="rm -rf", risk="high")]
+    _app(config, vault, snapshot, items, []).tick()
+    events = [e for e in vault.audit_trail(limit=20) if e["event"] == "blocked"]
+    assert events, "a withheld suggestion left no trace"
+    assert events[0]["detail"]["reason"] == "blocked_high_risk"
+    assert events[0]["detail"]["risk"] == "high"
+    assert events[0]["detail"]["context"] == snapshot.fingerprint()
+    assert vault.recent() == []
+
+
+def test_medium_can_be_switched_off_entirely(config, vault, snapshot) -> None:
+    config.allow_medium_risk = False
+    shown: list[Suggestion] = []
+    items = [
+        Suggestion(title="Gated", body="B", risk="medium"),
+        Suggestion(title="Fine", body="B", risk="low"),
+    ]
+    app = _app(config, vault, snapshot, items, shown)
+    app.tick()
+    assert [s.title for s in shown] == ["Fine"]
+    reasons = [
+        e["detail"]["reason"] for e in vault.audit_trail(limit=20) if e["event"] == "blocked"
+    ]
+    assert "blocked_medium_disabled" in reasons
+
+
+def test_cooldown_prevents_repeats(config, vault) -> None:
     shown: list[Suggestion] = []
     items = [Suggestion(title="A", body="B")]
-    app = _app(config, vault, snapshot, items, shown)
+
+    class _RotatingContext:
+        """Same suggestion, but a different context each cycle."""
+
+        def __init__(self) -> None:
+            self.n = 0
+
+        def capture(self, cwd=None):
+            self.n += 1
+            return ContextSnapshot(active_app="Code.exe", window_title=f"file{self.n}.py")
+
+    app = Aether(
+        config,
+        context_engine=_RotatingContext(),
+        suggestion_engine=StubSuggestions(items),
+        vault=vault,
+        presenter=shown.append,
+    )
     app.tick()
     app.tick()
     assert len(shown) == 1
+    assert app.stats.suppressed_cooldown == 1
+
+
+def test_unchanged_context_skips_a_second_identical_cycle(config, vault, snapshot) -> None:
+    """No new situation, no new suggestion - and no second model round trip."""
+    shown: list[Suggestion] = []
+    app = _app(config, vault, snapshot, [Suggestion(title="A", body="B")], shown)
+    app.tick()
+    app.tick()
+    assert len(shown) == 1
+    assert app.stats.suppressed_duplicate == 1
+    assert app.stats.suppressed_cooldown == 0
+
+
+def test_changed_clipboard_reopens_the_same_context(config, vault, snapshot) -> None:
+    shown: list[Suggestion] = []
+    app = _app(config, vault, snapshot, [Suggestion(title="A", body="B")], shown)
+    app.tick()
+    snapshot.clipboard_hash = "deadbeef1234"
+    app.tick()
+    assert len(shown) == 1  # identical fingerprint, so still stopped by cooldown
     assert app.stats.suppressed_cooldown == 1
 
 
@@ -95,7 +161,36 @@ def test_zero_budget_disables_suggestions_entirely(config, vault, snapshot) -> N
     shown: list[Suggestion] = []
     app = _app(config, vault, snapshot, [Suggestion(title="A", body="B")], shown)
     app.tick()
-    assert len(shown) == 1  # 0 means unlimited
+    assert app.tick() == []
+    assert shown == []
+    assert app.stats.suppressed_rate == 2
+
+
+def test_negative_budget_means_uncapped(config, vault) -> None:
+    """-1 removes the hourly ceiling; it is opt-in and discouraged."""
+    config.max_suggestions_per_hour = -1
+    config.cooldown_s = 0.0
+    shown: list[Suggestion] = []
+
+    class _RotatingContext:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def capture(self, cwd=None):
+            self.n += 1
+            return ContextSnapshot(active_app="Code.exe", window_title=f"f{self.n}.py")
+
+    app = Aether(
+        config,
+        context_engine=_RotatingContext(),
+        suggestion_engine=StubSuggestions([Suggestion(title="T", body="B")]),
+        vault=vault,
+        presenter=shown.append,
+    )
+    for _ in range(5):
+        app.tick()
+    assert app.stats.displayed == 5
+    assert app.stats.suppressed_rate == 0
 
 
 def test_generation_error_does_not_crash_the_loop(config, vault, snapshot) -> None:
@@ -124,6 +219,73 @@ def test_dismiss_is_recorded(config, vault, snapshot) -> None:
     app.tick()
     app.dismiss(shown[0].id)
     assert vault.recent()[0].decision == "dismissed"
+
+
+def test_snoozed_suggestion_is_never_shown_again(config, vault) -> None:
+    """'Never show me this again' outlives the cooldown and the hourly budget."""
+    shown: list[Suggestion] = []
+    app = _app(config, vault, _rotating_snapshot(0), [Suggestion(title="A", body="B")], shown)
+    app.tick()
+    app.dismiss(shown[0].id, snooze=True)
+
+    shown.clear()
+    for i in range(1, 6):
+        app = _app(
+            config,
+            vault,
+            _rotating_snapshot(i),
+            [Suggestion(title="A", body="B")],
+            shown,
+        )
+        app.tick()
+    assert shown == []
+    assert vault.active_suppressions(), "snooze was not persisted"
+
+
+def test_snooze_does_not_leak_into_other_suggestions(config, vault) -> None:
+    shown: list[Suggestion] = []
+    app = _app(config, vault, _rotating_snapshot(0), [Suggestion(title="A", body="B")], shown)
+    app.tick()
+    app.dismiss(shown[0].id, snooze=True)
+
+    other: list[Suggestion] = []
+    _app(config, vault, _rotating_snapshot(9), [Suggestion(title="B", body="D")], other).tick()
+    assert [s.title for s in other] == ["B"]
+
+
+def test_accept_is_recorded(config, vault, snapshot) -> None:
+    shown: list[Suggestion] = []
+    app = _app(config, vault, snapshot, [Suggestion(title="A", body="B")], shown)
+    app.tick()
+    app.accept(shown[0].id)
+    assert vault.recent()[0].decision == "accepted"
+
+
+def test_retention_prunes_old_history_on_shutdown(config, vault) -> None:
+    config.history_retention_days = 1
+    config.poll_interval_s = 0.01
+    stale = Suggestion(title="Old", body="B")
+    stale.created_at = time.time() - 86400 * 30
+    vault.record(stale)
+
+    app = Aether(
+        config,
+        context_engine=_CountingContext(),
+        suggestion_engine=StubSuggestions([]),
+        vault=vault,
+        presenter=lambda _s: None,
+    )
+    worker = threading.Thread(target=app.run_forever, daemon=True)
+    worker.start()
+    time.sleep(0.15)
+    app.stop()
+    worker.join(timeout=5.0)
+
+    assert vault.recent(limit=50) == []
+
+
+def _rotating_snapshot(n: int) -> ContextSnapshot:
+    return ContextSnapshot(active_app="Code.exe", window_title=f"file{n}.py")
 
 
 def test_cycle_increments_stats(config, vault, snapshot) -> None:

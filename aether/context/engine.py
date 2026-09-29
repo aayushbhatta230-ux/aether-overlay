@@ -11,12 +11,13 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..config import Config
 from ..models import ContextSnapshot
-from ..redact import fingerprint_clipboard, normalize_title, redact
+from ..redact import fingerprint_clipboard, normalize_title, redact, strip_modified_marker
 
 log = logging.getLogger(__name__)
 
@@ -37,11 +38,11 @@ def _probe_active_window() -> tuple[str, str]:
         if not hwnd:
             return ("unknown", "")
         title = win32gui.GetWindowText(hwnd) or ""
-        _thread_id = win32process.GetWindowThreadProcessId(hwnd)[1]
+        pid = win32process.GetWindowThreadProcessId(hwnd)[1]
         try:
             import psutil
 
-            app = psutil.Process(_thread_id).name()
+            app = psutil.Process(pid).name()
         except Exception:
             app = "unknown"
     except Exception as exc:  # pragma: no cover - depends on live desktop
@@ -114,6 +115,21 @@ class Probes:
     git_branch: Callable[[str], str | None] = _probe_git_branch
 
 
+@dataclass(slots=True)
+class _Dwell:
+    """Tracks how long the foreground application has not changed."""
+
+    app: str = ""
+    since: float = field(default_factory=time.monotonic)
+
+    def seconds_in(self, app: str) -> float:
+        if app != self.app:
+            self.app = app
+            self.since = time.monotonic()
+            return 0.0
+        return max(0.0, time.monotonic() - self.since)
+
+
 class ContextEngine:
     """Assembles redacted snapshots on demand."""
 
@@ -121,14 +137,17 @@ class ContextEngine:
         self.config = config
         self.probes = probes or Probes()
         self._last_clip_hash: str | None = None
+        self._dwell = _Dwell()
 
     def capture(self, cwd: str | None = None) -> ContextSnapshot:
         """Take one snapshot, applying redaction and every config toggle."""
         app, title = self._safe(self.probes.active_window, ("unknown", ""))
-        title = normalize_title(str(title or ""))
+        modified, title = strip_modified_marker(str(title or ""))
+        title = normalize_title(title)
         if self.config.redact_pii:
             app = redact(str(app or "unknown"))
             title = redact(title)
+        app = app or "unknown"
 
         idle = float(self._safe(self.probes.idle_seconds, 0.0) or 0.0)
 
@@ -148,13 +167,17 @@ class ContextEngine:
         if self.config.track_git_branch:
             branch = self._safe(lambda: self.probes.git_branch(workdir), None)
 
+        dwell = self._dwell.seconds_in(app) if idle < 5.0 else 0.0
+
         snap = ContextSnapshot(
-            active_app=app or "unknown",
+            active_app=app,
             window_title=title,
             idle_seconds=idle,
             clipboard_hash=clip_hash,
             git_branch=branch,
             working_dir=None,  # never exposed: paths are identifying
+            app_dwell_seconds=dwell,
+            document_modified=modified,
         )
         log.debug("captured context: %s", snap.to_llm_prompt().replace("\n", " | "))
         return snap

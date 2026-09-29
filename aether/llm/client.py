@@ -35,6 +35,7 @@ Hard rules:
   medium = would open, move, or create a file/tab
   high   = would send data, spend money, or delete something
 - Never invent facts about the user. Never include credentials or PII.
+- Be concrete and actionable. Prefer "run the tests" over "stay focused".
 - If the context is not interesting, return an empty list: {"suggestions": []}
 """
 
@@ -142,51 +143,100 @@ def parse_suggestions(raw: str) -> list[Suggestion]:
     return out[:2]
 
 
+# --------------------------------------------------------------------------
+# Deterministic rules
+# --------------------------------------------------------------------------
+#: Substrings that mean "something is on fire". Cheap, local, and actionable.
+_ERROR_MARKERS = (
+    "error", "traceback", "exception", "panic", "failed", "fatal",
+    "undefined", "assertionerror", "segfault", "crashed",
+)
 
-def _rule_based(snapshot: ContextSnapshot) -> list[Suggestion]:
-    """Deterministic fallback used when the LLM is unavailable."""
+#: Applications whose presence usually means the user is in a meeting.
+_MEETING_APPS = ("zoom", "teams", "meet", "slack huddle", "webex", "around")
+
+
+def _rule(title: str, body: str, confidence: float) -> Suggestion:
+    """Build a rule suggestion. Always ``low`` risk: a hint changes nothing."""
+    return Suggestion(title=title, body=body, risk="low", confidence=confidence, source="rules")
+
+
+def _rule_based(snapshot: ContextSnapshot, config: Config | None = None) -> list[Suggestion]:
+    """Deterministic fallback used when the LLM is unavailable.
+
+    Every rule is ``risk="low"``: a hint changes nothing. They exist so the
+    product is still worth running on a machine with no model installed.
+    """
     title = snapshot.window_title.lower()
+    app = (snapshot.active_app or "").lower()
 
-    if "error" in title or "traceback" in title:
+    if any(marker in title for marker in _ERROR_MARKERS):
         return [
-            Suggestion(
-                title="Read the error before editing",
-                body="The active window looks like a failure. Capture the exact "
-                     "message and stack before changing anything.",
-                risk="low",
-                confidence=0.6,
-                source="rules",
+            _rule(
+                "Read the error before editing",
+                "The active window looks like a failure. Capture the exact "
+                "message and stack before changing anything.",
+                0.6,
             )
         ]
+
+    if any(m in app or m in title for m in _MEETING_APPS):
+        return [
+            _rule(
+                "Meeting in progress",
+                "Looks like you are on a call. Silence notifications and jot "
+                "down the one thing worth remembering afterwards.",
+                0.55,
+            )
+        ]
+
+    if snapshot.document_modified:
+        return [
+            _rule(
+                "Unsaved changes on screen",
+                "The editor reports unsaved work. Save or commit before "
+                "switching context, so it cannot be lost.",
+                0.65,
+            )
+        ]
+
+    dwell_limit = config.dwell_reminder_s if config else 2700.0
+    if dwell_limit > 0 and snapshot.app_dwell_seconds >= dwell_limit:
+        minutes = int(snapshot.app_dwell_seconds // 60)
+        return [
+            _rule(
+                f"{minutes} minutes in {snapshot.active_app}",
+                "Long single-app session. Worth a short break, or capture the "
+                "next step before context switching.",
+                0.4,
+            )
+        ]
+
     if snapshot.git_branch and snapshot.git_branch.lower() not in ("main", "master"):
         return [
-            Suggestion(
-                title=f"On branch '{snapshot.git_branch}'",
-                body="Not a default branch - worth a commit before switching context.",
-                risk="low",
-                confidence=0.45,
-                source="rules",
+            _rule(
+                f"On branch '{snapshot.git_branch}'",
+                "Not a default branch - worth a commit before switching context.",
+                0.45,
             )
         ]
+
     if snapshot.clipboard_hash:
         return [
-            Suggestion(
-                title="Clipboard changed",
-                body="You copied something recently. Worth confirming it went "
-                     "where you intended.",
-                risk="low",
-                confidence=0.35,
-                source="rules",
+            _rule(
+                "Clipboard changed",
+                "You copied something recently. Worth confirming it went "
+                "where you intended.",
+                0.35,
             )
         ]
+
     if snapshot.is_idle(120):
         return [
-            Suggestion(
-                title="You've been idle a while",
-                body="Good moment to stretch, or to jot down the next task.",
-                risk="low",
-                confidence=0.3,
-                source="rules",
+            _rule(
+                "You've been idle a while",
+                "Good moment to stretch, or to jot down the next task.",
+                0.3,
             )
         ]
     return []
@@ -202,7 +252,7 @@ class SuggestionEngine:
     def generate(self, snapshot: ContextSnapshot) -> list[Suggestion]:
         if not snapshot.active_app or snapshot.active_app == "unknown":
             # Still allow rules (idle hint) but do not bother the LLM.
-            return _rule_based(snapshot)
+            return self._rules(snapshot)
 
         prompt = (
             "User context right now:\n"
@@ -217,10 +267,14 @@ class SuggestionEngine:
             )
         except Exception as exc:
             log.warning("LLM unavailable (%s); using rule fallback", exc)
-            return _rule_based(snapshot) if self.config.offline_fallback else []
+            return self._rules(snapshot)
 
         suggestions = parse_suggestions(raw)
         if not suggestions and self.config.offline_fallback:
-            return _rule_based(snapshot)
+            return self._rules(snapshot)
         return suggestions
 
+    def _rules(self, snapshot: ContextSnapshot) -> list[Suggestion]:
+        if not self.config.offline_fallback:
+            return []
+        return _rule_based(snapshot, self.config)

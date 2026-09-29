@@ -50,6 +50,63 @@ def test_working_dir_is_never_exposed(config, probes) -> None:
     assert ContextEngine(config, probes).capture().working_dir is None
 
 
+def test_unsaved_marker_becomes_a_flag_not_a_title(config) -> None:
+    p = Probes(
+        active_window=lambda: ("Code.exe", "*app.py - Visual Studio Code"),
+        idle_seconds=lambda: 0.0,
+        clipboard=lambda: None,
+        git_branch=lambda _c: None,
+    )
+    snap = ContextEngine(config, p).capture()
+    assert snap.document_modified is True
+    assert not snap.window_title.startswith("*")
+    assert snap.window_title == "app.py - Visual Studio Code"
+
+
+def test_clean_title_reports_no_modification(config, probes) -> None:
+    assert ContextEngine(config, probes).capture().document_modified is False
+
+
+def test_dwell_grows_while_the_app_is_unchanged(config, probes) -> None:
+    engine = ContextEngine(config, probes)
+    assert engine.capture().app_dwell_seconds == 0.0
+    assert engine.capture().app_dwell_seconds >= 0.0
+
+
+def test_dwell_resets_when_the_app_changes(config) -> None:
+    apps = iter([("Code.exe", "a.py"), ("chrome.exe", "b"), ("Code.exe", "a.py")])
+    p = Probes(
+        active_window=lambda: next(apps),
+        idle_seconds=lambda: 0.0,
+        clipboard=lambda: None,
+        git_branch=lambda _c: None,
+    )
+    engine = ContextEngine(config, p)
+    assert engine.capture().app_dwell_seconds == 0.0
+    assert engine.capture().app_dwell_seconds == 0.0  # switched away
+    assert engine.capture().app_dwell_seconds == 0.0  # came back
+
+
+def test_dwell_is_not_claimed_while_idle(config) -> None:
+    p = Probes(
+        active_window=lambda: ("Code.exe", "a.py"),
+        idle_seconds=lambda: 600.0,
+        clipboard=lambda: None,
+        git_branch=lambda _c: None,
+    )
+    engine = ContextEngine(config, p)
+    engine.capture()
+    assert engine.capture().app_dwell_seconds == 0.0
+
+
+def test_new_context_fields_reach_the_prompt(snapshot) -> None:
+    snapshot.app_dwell_seconds = 3600.0
+    snapshot.document_modified = True
+    prompt = snapshot.to_llm_prompt()
+    assert "minutes_in_app: 60" in prompt
+    assert "document_modified: true" in prompt
+
+
 def test_probe_failure_degrades_gracefully(config) -> None:
     def boom() -> tuple[str, str]:
         raise RuntimeError("win32 exploded")
