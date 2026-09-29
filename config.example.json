@@ -1,0 +1,13 @@
+{
+  "ollama_model": "llama3.2",
+  "poll_interval_s": 5.0,
+  "idle_threshold_s": 180.0,
+  "cooldown_s": 900.0,
+  "max_suggestions_per_hour": 8,
+  "overlay_corner": "bottom-right",
+  "overlay_opacity": 0.96,
+  "overlay_timeout_s": 12.0,
+  "track_clipboard": true,
+  "track_git_branch": true,
+  "redact_pii": true
+}
