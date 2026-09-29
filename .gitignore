@@ -26,7 +26,10 @@ aether.log
 *.pem
 *.key
 
---- Editors / OS
+# Debug / scratch
+err.txt
+*.tmp
+
 .vscode/
 .idea/
 *.swp
