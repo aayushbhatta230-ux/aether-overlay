@@ -59,6 +59,19 @@ monthly subscription. AETHER takes the opposite position:
 5. `Vault` suppresses anything seen within the cooldown, then records the rest.
 6. The overlay shows the card for `overlay_timeout_s` seconds.
 
+### Threading model
+
+Tk is not thread-safe, so the two halves of the process are strictly separated:
+
+| Thread | Owns | Talks to the other via |
+|---|---|---|
+| **Main** | The Tk event loop, every widget, the auto-hide timers | `Overlay.post()` → `queue.Queue`, drained by a 100 ms `after` pump |
+| **Worker** (`aether-poller`) | The polling loop, Ollama calls, the vault | `Aether.stop()` → `threading.Event`, so shutdown is immediate instead of waiting out `poll_interval_s` |
+
+Running the polling loop on the main thread is what made the window report
+"not responding" — the loop blocked the event loop for a full interval every
+cycle. The tests assert the split so it cannot regress.
+
 ## 🚀 Quickstart
 
 ```bash
@@ -112,7 +125,7 @@ AETHER_OLLAMA_MODEL=phi3 AETHER_COOLDOWN_S=300 python -m aether
 ## 🧪 Development
 
 ```bash
-pytest -q                       # 72 tests, no desktop required
+pytest -q                       # 77 tests, no desktop required
 ruff check aether tests
 pytest --cov=aether             # coverage
 ```

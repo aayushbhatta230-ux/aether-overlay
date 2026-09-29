@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from aether.app import Aether
@@ -150,3 +153,123 @@ def test_risk_matrix(config, vault, snapshot, risk, expected_shown) -> None:
     app = _app(config, vault, snapshot, [Suggestion(title="T", body="B", risk=risk)], shown)
     app.tick()
     assert len(shown) == expected_shown
+
+
+# --------------------------------------------------------------------------
+# Loop lifecycle
+#
+# Regression cover for the "window is not responding" bug: the polling loop
+# must never own the thread that runs Tk's main loop, and stop() must take
+# effect immediately rather than after a full poll interval.
+# --------------------------------------------------------------------------
+
+
+class _CountingContext:
+    """Context stub that always reports an active, non-idle user."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def capture(self, cwd=None) -> ContextSnapshot:
+        self.calls += 1
+        return ContextSnapshot(active_app="Code.exe", idle_seconds=0.0)
+
+
+def test_poller_does_not_run_on_the_calling_thread(config, vault) -> None:
+    """The poller must be safe to run on a worker, never blocking the UI."""
+    config.poll_interval_s = 0.01
+    seen: list[int] = []
+
+    app = Aether(
+        config,
+        context_engine=_CountingContext(),
+        suggestion_engine=StubSuggestions([Suggestion(title="T", body="B")]),
+        vault=vault,
+        presenter=lambda _s: seen.append(threading.get_ident()),
+    )
+
+    worker = threading.Thread(target=app.run_forever, name="aether-poller")
+    worker.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while not seen and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        app.stop()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive(), "poller did not honour stop()"
+    assert seen, "presenter was never called"
+    assert threading.get_ident() not in seen, "poller ran on the caller's thread"
+
+
+def test_stop_interrupts_a_long_poll_interval(config, vault) -> None:
+    """stop() must not wait out the interval, even a very long one."""
+    config.poll_interval_s = 30.0  # a time.sleep loop would hang for 30s
+    app = Aether(
+        config,
+        context_engine=_CountingContext(),
+        suggestion_engine=StubSuggestions([]),
+        vault=vault,
+        presenter=lambda _s: None,
+    )
+
+    worker = threading.Thread(target=app.run_forever, daemon=True)
+    worker.start()
+    time.sleep(0.2)  # let it enter the wait
+    app.stop()
+    worker.join(timeout=5.0)
+
+    assert not worker.is_alive(), "stop() did not interrupt the poll wait"
+
+
+def test_stop_before_start_prevents_any_cycle(config, vault) -> None:
+    app = Aether(
+        config,
+        context_engine=_CountingContext(),
+        suggestion_engine=StubSuggestions([]),
+        vault=vault,
+        presenter=lambda _s: None,
+    )
+    app.stop()
+    app.run_forever()
+    assert app.stats.cycles == 0
+
+
+def test_stop_is_safe_from_another_thread_and_repeatable(config, vault) -> None:
+    app = Aether(
+        config,
+        context_engine=_CountingContext(),
+        suggestion_engine=StubSuggestions([]),
+        vault=vault,
+        presenter=lambda _s: None,
+    )
+    stopper = threading.Thread(target=app.stop, daemon=True)
+    stopper.start()
+    app.stop()  # concurrent duplicate
+    stopper.join(timeout=2.0)
+
+    assert app._stop.is_set()
+    app.run_forever()  # returns immediately
+    assert app.stats.cycles == 0
+
+
+def test_run_forever_always_records_a_stop_audit_entry(config, vault) -> None:
+    config.poll_interval_s = 0.01
+    app = Aether(
+        config,
+        context_engine=_CountingContext(),
+        suggestion_engine=StubSuggestions([]),
+        vault=vault,
+        presenter=lambda _s: None,
+    )
+    worker = threading.Thread(target=app.run_forever, daemon=True)
+    worker.start()
+    time.sleep(0.1)
+    app.stop()
+    worker.join(timeout=5.0)
+
+    events = [entry["event"] for entry in vault.audit_trail(limit=10)]
+    assert "started" in events
+    assert "stopped" in events
+

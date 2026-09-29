@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import threading
 from collections.abc import Sequence
 
 from . import __version__
@@ -125,14 +126,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     overlay = Overlay(config)
-    aether = Aether(config, presenter=overlay.show)
+    # Tk is not thread-safe and its main loop must own this thread, so the
+    # polling loop runs on a worker and hands cards over via overlay.post.
+    aether = Aether(config, presenter=overlay.post)
+
+    if args.once:
+        aether.tick()
+        overlay.wait_for_exit(poll_ms=min(int(config.overlay_timeout_s * 1000), 250))
+        overlay.destroy()
+        return 0
+
+    worker = threading.Thread(
+        target=aether.run_forever, name="aether-poller", daemon=True
+    )
+    worker.start()
     try:
-        if args.once:
-            aether.tick()
-            overlay.root.update()
-            return 0
-        aether.run_forever()
+        overlay.run()
+    except KeyboardInterrupt:
+        log.info("interrupted; shutting down")
     finally:
+        aether.stop()
+        worker.join(timeout=5.0)
         overlay.destroy()
     return 0
 

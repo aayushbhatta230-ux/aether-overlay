@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import platform
+import queue
 import tkinter as tk
 
 from ..config import Config
@@ -77,6 +78,16 @@ class Overlay:
 
         self.root.bind("<Escape>", lambda _e: self.hide())
         self._after_id: str | None = None
+        self._pump_id: str | None = None
+        #: Tk is not thread-safe. The polling loop runs on a worker thread and
+        #: hands suggestions over this queue; a Tk timer drains it on the UI
+        #: thread. Never touch a widget from another thread.
+        self._inbox: queue.Queue[Suggestion] = queue.Queue()
+        #: True while :meth:`run` owns the Tk main loop. The pump only reschedules
+        #: itself while this is set, so timers stop at shutdown.
+        self._running = False
+        #: Optional callback invoked when the window is asked to close.
+        self._on_close = None
         self._position()
 
     # -- geometry --------------------------------------------------------
@@ -130,14 +141,82 @@ class Overlay:
 
     def destroy(self) -> None:
         self._cancel_timer()
+        if self._pump_id is not None:
+            try:
+                self.root.after_cancel(self._pump_id)
+            except tk.TclError:  # pragma: no cover
+                pass
+            self._pump_id = None
         try:
             self.root.destroy()
         except tk.TclError:  # pragma: no cover
             pass
 
     def run(self) -> None:
-        """Block on the Tk event loop (used when AETHER runs headless-visible)."""
-        self.root.mainloop()
+        """Own the Tk main loop. Blocks until the window is destroyed.
+
+        This **must** be called on the thread that created the window. The
+        polling loop belongs on a separate worker thread and communicates through
+        :meth:`post`; blocking this thread with the polling loop is what made the
+        window report "not responding".
+        """
+        self._running = True
+        self._schedule_pump()
+        try:
+            self.root.mainloop()
+        finally:
+            self._running = False
+            if self._on_close is not None:
+                callback, self._on_close = self._on_close, None
+                callback()
+
+    def post(self, suggestion: Suggestion) -> None:
+        """Thread-safe entry point for the presenter.
+
+        Safe to call from the polling worker thread: it only enqueues, and the Tk
+        timer callback does the actual widget work.
+        """
+        self._inbox.put(suggestion)
+
+    def request_close(self, on_close=None) -> None:
+        """Ask the main loop to shut down. Callable from any thread."""
+        self._on_close = on_close
+        try:
+            self.root.quit()  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - Tk is not thread-safe
+            # ``root.quit`` from a worker thread can raise if the interpreter is
+            # finalising. The window is torn down by the caller's finally block.
+            pass
+
+    def _schedule_pump(self) -> None:
+        try:
+            self._pump_id = self.root.after(100, self._pump)
+        except tk.TclError:  # pragma: no cover - window already destroyed
+            self._pump_id = None
+
+    def _pump(self) -> None:
+        """Drain pending suggestions on the Tk thread."""
+        self._pump_id = None
+        try:
+            while True:
+                self.show(self._inbox.get_nowait())
+        except queue.Empty:
+            pass
+        except tk.TclError:  # pragma: no cover - destroyed mid-drain
+            return
+        if self._running:
+            self._schedule_pump()
+
+    def wait_for_exit(self, poll_ms: int = 200) -> None:
+        """Block until the window is closed, then return. Used by tests."""
+        while True:
+            try:
+                self.root.update()
+            except tk.TclError:
+                return
+            if not self.root.winfo_exists():
+                return
+            self.root.after(poll_ms)
 
 
 def console_fallback(suggestion: Suggestion) -> str:

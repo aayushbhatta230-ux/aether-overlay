@@ -8,6 +8,7 @@ orchestrator itself is testable by injecting fakes for each of them.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -67,7 +68,7 @@ class Aether:
         self.suggestions = suggestion_engine or SuggestionEngine(config)
         self.presenter = presenter or (lambda s: log.info("%s", s.title))
         self.stats = Stats()
-        self._stop = False
+        self._stop = threading.Event()
 
     # -- one cycle -------------------------------------------------------
     def tick(self, cwd: str | None = None) -> list[Suggestion]:
@@ -123,7 +124,13 @@ class Aether:
 
     # -- loop ------------------------------------------------------------
     def run_forever(self, cwd: str | None = None) -> None:
-        """Poll until :meth:`stop` is called or the process is interrupted."""
+        """Poll until :meth:`stop` is called.
+
+        This is designed to run on a **worker thread**, never the thread that
+        owns the UI. Each iteration blocks on ``self._stop`` rather than
+        ``time.sleep`` so that :meth:`stop` takes effect immediately instead of
+        after a full poll interval.
+        """
         log.info(
             "AETHER online (model=%s, interval=%.1fs, max %d/hr)",
             self.config.ollama_model,
@@ -132,16 +139,20 @@ class Aether:
         )
         self.vault.audit("started", {"version": _version(), "cwd": bool(cwd)})
         try:
-            while not self._stop:
+            while not self._stop.is_set():
                 self.tick(cwd)
-                time.sleep(self.config.poll_interval_s)
-        except KeyboardInterrupt:
-            log.info("interrupted; shutting down")
+                if self._stop.wait(self.config.poll_interval_s):
+                    break
+        except Exception as exc:  # pragma: no cover - defensive on the worker
+            log.exception("polling loop aborted: %s", exc)
+            self.stats.errors += 1
         finally:
             self.vault.audit("stopped", self.stats.as_dict())
+            log.info("AETHER stopped after %d cycles", self.stats.cycles)
 
     def stop(self) -> None:
-        self._stop = True
+        """Signal the polling loop to finish. Safe to call from any thread."""
+        self._stop.set()
 
     # -- decisions -------------------------------------------------------
     def dismiss(self, suggestion_id: str) -> None:
