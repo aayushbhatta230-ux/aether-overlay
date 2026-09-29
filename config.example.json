@@ -4,10 +4,17 @@
   "idle_threshold_s": 180.0,
   "cooldown_s": 900.0,
   "max_suggestions_per_hour": 8,
+  "dwell_reminder_s": 2700.0,
   "overlay_corner": "bottom-right",
   "overlay_opacity": 0.96,
   "overlay_timeout_s": 12.0,
+  "overlay_always_on_top": true,
   "track_clipboard": true,
   "track_git_branch": true,
-  "redact_pii": true
+  "redact_pii": true,
+  "allow_medium_risk": true,
+  "offline_fallback": true,
+  "audit_log": true,
+  "history_retention_days": 30,
+  "dismiss_snooze_s": 86400.0
 }

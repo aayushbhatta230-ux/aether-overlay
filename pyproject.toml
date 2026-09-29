@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aether-overlay"
-version = "0.1.0"
+version = "0.2.0"
 description = "Ambient, local-first AI overlay that surfaces discreet desktop suggestions on Windows"
 readme = "README.md"
 authors = [{ name = "Aayush Bhatta" }]

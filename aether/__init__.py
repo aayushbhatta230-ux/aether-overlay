@@ -5,5 +5,5 @@ short, useful suggestions from a *local* LLM. It never takes actions on its own:
 anything with real-world consequence passes through an explicit risk gate.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["__version__"]

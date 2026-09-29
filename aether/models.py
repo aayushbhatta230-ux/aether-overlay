@@ -29,13 +29,22 @@ class ContextSnapshot:
     clipboard_hash: str | None = None
     git_branch: str | None = None
     working_dir: str | None = None
+    #: How long the user has been in ``active_app`` without switching away.
+    app_dwell_seconds: float = 0.0
+    #: True when the window title carried an editor's "modified" marker.
+    document_modified: bool = False
     captured_at: float = field(default_factory=_now)
 
     def is_idle(self, threshold_s: float) -> bool:
         return self.idle_seconds >= threshold_s
 
     def fingerprint(self) -> str:
-        """Stable identity for cooldown/dedupe purposes."""
+        """Stable, non-reversible identity for a context.
+
+        Used to tie audit rows to the situation that produced them without
+        storing the situation itself: same app + same title + same branch
+        always hashes to the same value.
+        """
         raw = f"{self.active_app}|{self.window_title}|{self.git_branch or ''}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
@@ -53,6 +62,10 @@ class ContextSnapshot:
             lines.append(f"clipboard_fingerprint: {self.clipboard_hash}")
         if self.idle_seconds:
             lines.append(f"idle_seconds: {int(self.idle_seconds)}")
+        if self.app_dwell_seconds >= 60:
+            lines.append(f"minutes_in_app: {int(self.app_dwell_seconds // 60)}")
+        if self.document_modified:
+            lines.append("document_modified: true")
         return "\n".join(lines)
 
 
@@ -75,6 +88,8 @@ class Suggestion:
     def __post_init__(self) -> None:
         self.risk = (self.risk or "low").strip().lower()
         if self.risk not in RISK_ORDER:
+            # An unrecognised tier is treated as the *more* cautious one: a
+            # model that invents "critical" gets gated, not waved through.
             self.risk = "medium" if self.risk else "low"
         self.confidence = min(1.0, max(0.0, float(self.confidence)))
         if not self.fingerprint:

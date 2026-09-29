@@ -2,7 +2,12 @@
 
 Built on ``tkinter`` (stdlib) so the HUD works with zero extra dependencies.
 On non-Windows platforms the window still renders - it simply cannot be
-topmost or click-through, and the code says so rather than pretending.
+topmost, and the code says so rather than pretending.
+
+Interaction is deliberately inert: ``Esc`` hides, ``d`` records a dismissal,
+``s`` snoozes a suggestion for a day, ``a`` marks it useful, ``q`` quits.
+None of them *perform* the suggestion - that is what keeps the
+observe-never-act invariant true at the UI layer.
 """
 
 from __future__ import annotations
@@ -10,7 +15,9 @@ from __future__ import annotations
 import logging
 import platform
 import queue
+import time
 import tkinter as tk
+from collections.abc import Callable
 
 from ..config import Config
 from ..models import Suggestion
@@ -30,17 +37,21 @@ _BG = "#11151C"
 _FG = "#E6EDF3"
 _MUTED = "#8B949E"
 
+#: ``(suggestion_id, decision, snooze)`` handed back to the orchestrator.
+DecisionHook = Callable[[str, str, bool], None]
+
 
 class Overlay:
     """A single suggestion card that floats over everything else.
 
     The overlay is *display only*. It has no click handlers that trigger
-    actions - dismissing is the only interaction, which is what keeps the
-    observe-never-act invariant true at the UI layer.
+    actions - reporting a decision back to the orchestrator is the only thing
+    a key press can do.
     """
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, on_decision: DecisionHook | None = None) -> None:
         self.config = config
+        self.on_decision = on_decision
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title("AETHER")
@@ -77,6 +88,10 @@ class Overlay:
         self.footer.grid(row=2, column=1, sticky="w", pady=(10, 0))
 
         self.root.bind("<Escape>", lambda _e: self.hide())
+        self.root.bind("q", self._on_quit)
+        self.root.bind("d", lambda _e: self._decide("dismissed", snooze=False))
+        self.root.bind("s", lambda _e: self._decide("snoozed", snooze=True))
+        self.root.bind("a", lambda _e: self._decide("accepted", snooze=False))
         self._after_id: str | None = None
         self._pump_id: str | None = None
         #: Tk is not thread-safe. The polling loop runs on a worker thread and
@@ -86,6 +101,8 @@ class Overlay:
         #: True while :meth:`run` owns the Tk main loop. The pump only reschedules
         #: itself while this is set, so timers stop at shutdown.
         self._running = False
+        #: The card currently on screen, so a key press knows what it is about.
+        self._current: Suggestion | None = None
         #: Optional callback invoked when the window is asked to close.
         self._on_close = None
         self._position()
@@ -111,12 +128,15 @@ class Overlay:
     def show(self, suggestion: Suggestion) -> None:
         """Render a suggestion and auto-hide it after the configured timeout."""
         self._cancel_timer()
+        self._current = suggestion
         self.title_label.configure(text=suggestion.title[:60])
         self.body_label.configure(text=suggestion.body[:180])
         self.dot.configure(fg=_RISK_COLOURS.get(suggestion.risk, _MUTED))
 
         gated = " · approval required" if suggestion.is_gated else ""
-        self.footer.configure(text=f"AETHER · {suggestion.source}{gated} · esc to dismiss")
+        self.footer.configure(
+            text=f"AETHER · {suggestion.source}{gated} · esc hide · s snooze · q quit"
+        )
 
         self.root.deiconify()
         self.root.lift()
@@ -127,8 +147,19 @@ class Overlay:
             int(self.config.overlay_timeout_s * 1000), self.hide
         )
 
+    def present(self, suggestion: Suggestion) -> None:
+        """Show ``suggestion`` on the **calling (UI) thread**.
+
+        Used by the single-shot paths, where there is no running pump to hand
+        the work to. Calling :meth:`show` from a worker thread is a Tcl
+        violation, so those paths must not use :meth:`post`.
+        """
+        self.show(suggestion)
+
     def hide(self) -> None:
+        """Dismiss the card. Called by the auto-hide timer and by key presses."""
         self._cancel_timer()
+        self._current = None
         self.root.withdraw()
 
     def _cancel_timer(self) -> None:
@@ -152,6 +183,38 @@ class Overlay:
         except tk.TclError:  # pragma: no cover
             pass
 
+    # -- decisions -------------------------------------------------------
+    def _decide(self, decision: str, snooze: bool) -> None:
+        """Report the decision on the current card, then dismiss it."""
+        suggestion, self._current = self._current, None
+        self.hide()
+        if suggestion is None or self.on_decision is None:
+            return
+        try:
+            self.on_decision(suggestion.id, decision, snooze)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("decision hook failed: %s", exc)
+
+    def _on_quit(self, _event=None) -> None:
+        if self._current is not None and self.on_decision is not None:
+            try:
+                self.on_decision(self._current.id, "dismissed", False)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        self.request_close()
+
+    def request_close(self, on_close: Callable[[], None] | None = None) -> None:
+        """Ask the main loop to shut down. Callable from any thread."""
+        if on_close is not None:
+            self._on_close = on_close
+        try:
+            self.root.quit()  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - Tk is not thread-safe
+            # ``root.quit`` from a worker thread can raise if the interpreter is
+            # finalising. The window is torn down by the caller's finally block.
+            pass
+
+    # -- loop ------------------------------------------------------------
     def run(self) -> None:
         """Own the Tk main loop. Blocks until the window is destroyed.
 
@@ -178,16 +241,6 @@ class Overlay:
         """
         self._inbox.put(suggestion)
 
-    def request_close(self, on_close=None) -> None:
-        """Ask the main loop to shut down. Callable from any thread."""
-        self._on_close = on_close
-        try:
-            self.root.quit()  # type: ignore[attr-defined]
-        except Exception:  # pragma: no cover - Tk is not thread-safe
-            # ``root.quit`` from a worker thread can raise if the interpreter is
-            # finalising. The window is torn down by the caller's finally block.
-            pass
-
     def _schedule_pump(self) -> None:
         try:
             self._pump_id = self.root.after(100, self._pump)
@@ -207,15 +260,26 @@ class Overlay:
         if self._running:
             self._schedule_pump()
 
-    def wait_for_exit(self, poll_ms: int = 200) -> None:
-        """Block until the window is closed, then return. Used by tests."""
+    def wait_for_exit(self, poll_ms: int = 200, timeout_s: float | None = None) -> bool:
+        """Pump the Tk event loop until the card is gone or ``timeout_s`` elapses.
+
+        Returns ``True`` if the card closed on its own, ``False`` on timeout.
+        The bound matters: without it a card that never closes would hang the
+        caller forever. With no card on screen it returns straight away.
+        """
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
         while True:
             try:
                 self.root.update()
+                alive = self.root.winfo_exists()
             except tk.TclError:
-                return
-            if not self.root.winfo_exists():
-                return
+                return True
+            if not alive:
+                return True
+            if self._after_id is None and self._current is None:
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
             self.root.after(poll_ms)
 
 
@@ -226,7 +290,10 @@ def console_fallback(suggestion: Suggestion) -> str:
     gate without ever flashing a window at someone.
     """
     bar = {"low": "OK  ", "medium": "GATE", "high": "HOLD"}[suggestion.risk]
-    lines = [f"[{bar}] {suggestion.title}", f"       {suggestion.body}"]
-    if suggestion.is_gated:
-        lines.append("       (approval required - AETHER will not act)")
+    lines = [
+        f"[{bar}] {suggestion.title}",
+        f"       {suggestion.body}",
+        f"       context: {suggestion.source}"
+        + ("  · approval required - AETHER will not act" if suggestion.is_gated else ""),
+    ]
     return "\n".join(lines)
